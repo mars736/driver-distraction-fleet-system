@@ -53,4 +53,4 @@ class Resnet50(nn.Module):
         x = self.layer3(x)
         x = self.layer4(x)
         x = self.avgpool(x)
-        #先写到这
+        #先写到这l
