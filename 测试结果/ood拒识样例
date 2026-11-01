@@ -1,0 +1,2 @@
+![img_3.png](img_3.png)
+'results': [{'pred': 1, 'class\_name': '右手玩手机', 'max\_p': 0.6121, 'energy': -2.1629, 'knn\_dist': 221.4061, 'is\_ood': True

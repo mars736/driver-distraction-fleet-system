@@ -1,4 +1,9 @@
+import json
+
+import argparse
+
 import os
+import time
 import pandas as pd
 import torch
 import torchvision
@@ -42,7 +47,7 @@ class DriverDataset(Dataset):
         :return: image返回PIL图片,label返回该图片的标签
         """
         row=self.df.iloc[idx]    #iloc函数提取出DataFrame的一行
-        path = os.path.join(self.imgs_root,row["filename"])#把路径拼出来，准备打开该文件
+        path = os.path.join(self.imgs_root,row["classname"],row["img"])#把路径拼出来，准备打开该文件
         image= Image.open(path).convert("RGB")#以RBG格式打开图片，这里返回的不是张量，如果不走transform就一定在loader那里会出问题，因为loader只吃张量
         label=self.class_to_idx[row["classname"]]
         if self.transform:
@@ -149,11 +154,11 @@ def print_report(cm):
     print("类别  精确率  召回率  F1")
     for i in range(cm.shape[0]):#遍历每个类别
         tp=cm[i,i]
-        fp=cm[i,i]-tp
-        fn=cm[i,i]-fp
-        precision=tp/(tp+fp)
-        recall=tp/(tp+fn)
-        f1=2*precision*recall/(precision+recall)
+        fp=cm[:,i].sum()-tp
+        fn=cm[i,:].sum()-tp
+        precision=tp/(tp+fp) if (tp+fp) else 0.0
+        recall=tp/(tp+fn) if (tp+fn) else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
         print(f"c{i:<2} {precision:6.3f} {recall:6.3f} {f1:6.3f}  ({CLASS_NAMES[f'c{i}']})")
 
 
@@ -187,7 +192,10 @@ def build_faiss_index(model,loader,device,out_path):
 #   feats:  (76,  2048)   ← axis=0 首尾相接，列数不变
     index=faiss.IndexFlatL2(feats.shape[1])#创建一个L2距离索引，告诉它我们的特征维度是多少（列数）
     index.add(feats)#把所有特征加进来
-    faiss.write_index(index,out_path)#保存进磁盘
+    # faiss.write_index 底层用 C++ 的 fopen，遇到中文路径（工作夹）会报 Illegal byte sequence；
+    # 改成先序列化成 bytes，再用 Python 的 open 写，Python 原生支持中文路径。
+    with open(out_path,"wb") as f:
+        f.write(faiss.serialize_index(index).tobytes())
     print(f"[FAISS] 已保存索引，样本数={feats.shape[0]}，维度={feats.shape[1]} -> {out_path}")
 
 
@@ -195,7 +203,131 @@ def build_faiss_index(model,loader,device,out_path):
 
 
 def main():
-    pass
+    base=r"C:\Users\jianxuyang\Desktop\codex工作夹2\resnet50"
+    parser=argparse.ArgumentParser()#属于python标准库，管理命令行参数
+    parser.add_argument("--csv",default=base + r"\state-farm-distracted-driver-detection\driver_imgs_list.csv")
+    parser.add_argument("--imgs",default=base + r"\state-farm-distracted-driver-detection\imgs\train")
+    parser.add_argument("--out",default=base + r"\output")
+    parser.add_argument("--epochs",default=15,type=int)
+    parser.add_argument("--batch-size",default=32,type=int)
+    parser.add_argument("--lr",default=1e-4,type=float)
+    parser.add_argument("--val-drivers",default=5,type=int)
+    parser.add_argument("--num-workers",default=5,type=int)
+    args=parser.parse_args()#解析命令行参数，返回一个对象，对象里有所有参数的值
+
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device:{device}")
+
+    #todo：1.处理数据
+    df=pd.read_csv(args.csv)
+    subjects=sorted(df["subject"].unique())#先拿到所有司机，排个序
+    val_subjects=subjects[:args.val_drivers]#验证集取自train文件夹的前五位司机
+    train_subjects=subjects[args.val_drivers:]#训练集取自train文件加的其余司机，注意test文件夹里没有标签，只是模型盲猜的数据
+    train_df=df[df["subject"].isin(train_subjects)]#训练集取第六位开始的司机
+    val_df=df[df["subject"].isin(val_subjects)]#验证集只取前五位司机
+    print(f"司机总数={len(subjects)}，训练司机={len(train_subjects)}，验证司机={len(val_subjects)}")
+    print("验证集司机:", val_subjects)
+
+    #todo：2.Dataset
+    train_tf,val_tf=build_transforms()
+    train_ds=DriverDataset(train_df,args.imgs,train_tf)
+    val_ds=DriverDataset(val_df,args.imgs,val_tf)
+    #准备训练集和测试集的loader
+    train_loader=DataLoader(train_ds,batch_size=args.batch_size,shuffle=True,num_workers=args.num_workers,pin_memory=True)
+    #shuffle=true每一轮都会打乱图片顺序
+    # num_workers为loader子代理数量，模型处理完上一批后代理进程紧接着就可以把图片塞进模型
+    #pin_memory=true，把准备好的图片数据锁死在该分页，防止被分页调度换下去，但是只对gpu有加速效果，cpu开这个有额外调度开销
+    val_loader=DataLoader(val_ds,batch_size=args.batch_size,shuffle=False,num_workers=args.num_workers,pin_memory=True)
+
+    #建建faiss用的loader
+    all_ds=DriverDataset(df,args.imgs,val_tf)
+    all_loader=DataLoader(all_ds,batch_size=args.batch_size,shuffle=False,num_workers=args.num_workers)
+
+    #todo:3.新建model、损失函数、优化器、调度器（衰减学习率）
+    model=Resnet50(10).to(device)#这里的10是__init__里面的输出分类种数参数，数据在gpu，把model也搬上gpu
+    criterion=nn.CrossEntropyLoss()
+    optimizer=torch.optim.AdamW(model.parameters(),lr=args.lr)
+    scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode='min',factor=0.5,patience=2)#学习率调度器，连续两次acc/loss不降，lr就*2
+
+    os.makedirs(args.out,exist_ok=True)#没有output文件夹就新建一个
+    best_acc=0.0#练到最后的acc不一定好，可以记录下中间最好的acc
+    best_ckpt=os.path.join(args.out,"best.pth")#模型最佳权重的路径
+    best_cm=None
+    total_start = time.time()
+
+    #todo：4.训练
+    for epoch in range(1,args.epochs+1):
+        epoch_start = time.time()
+        model.train()
+        running_loss = 0.0#统计一下这一轮的loss
+
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)#之前模型已经在gpu上了，现在把loader输出的数据也放在这里
+
+            #1.删除缓存的梯度，不然会累积
+            optimizer.zero_grad()
+
+            #2.前向传播
+            logits,_=model(images)
+
+            #3.算这一批次的loss
+            loss = criterion(logits,labels)
+
+            #4.反向传播
+            loss.backward()
+
+            #5.更新权重
+            optimizer.step()
+
+            running_loss+=loss.item()*labels.size(0)
+        train_loss=running_loss/len(train_ds)#算一下这一轮的平均loss
+
+        #一轮结束，用验证集验证一下
+        val_acc,val_loss,cm=evaluate(model,val_loader,device,criterion)
+        scheduler.step(val_loss)#loss连续两轮没降，lr就*2
+
+        epoch_seconds = time.time() - epoch_start
+        print(f"epoch:{epoch}/{args.epochs}  耗时:{epoch_seconds/60:.1f}分钟")
+        print(f"train_loss:{train_loss},val_loss:{val_loss}")
+
+        if val_acc > best_acc:
+            best_acc=val_acc
+            best_cm=cm
+            torch.save(
+                {
+                    "model_state": model.state_dict(),
+                    "class_names":list(CLASS_NAMES.keys()),
+                    "val_acc":val_acc,
+                },
+                best_ckpt# 保存路径
+            )
+            print(f"保存最好模型：val_acc:{val_acc:.4f}")
+
+    #所有轮数都已跑完
+    print(f"全部轮数已结束，最佳验证准确率：{best_acc:.4f}")
+    print(f"总耗时:{(time.time()-total_start)/60:.1f}分钟")
+
+    #todo:5.输出混淆矩阵,f1等各类指标
+    if best_cm is not None:
+        print("\n最终验证集混淆矩阵")
+        print(best_cm)
+        print_report(best_cm)
+
+    #todo：6.构建faiss索引
+    ckpt=torch.load(best_ckpt,map_location=device)
+    model.load_state_dict(ckpt["model_state"])
+    faiss_path=os.path.join(args.out,"faiss.pth")
+    build_faiss_index(model,all_loader,device,faiss_path)
+
+    #todo:7.保存类别映射
+    with open(os.path.join(args.out,"label_map.json"),'w',encoding='utf-8') as f:
+        json.dump({f"c{i}": CLASS_NAMES[f"c{i}"] for i in range(10)},f,ensure_ascii=False,indent=2)#ensure_ascii=False防止乱码，indent=2缩进为2
+    print(f"类别映射文件保存完成，输出目录为：{args.out}")
+
+
+
+if __name__ == "__main__":
+    main()
 
 
 

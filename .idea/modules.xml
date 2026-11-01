@@ -4,6 +4,7 @@
     <modules>
       <module fileurl="file://D:/JetBrains/PycharmProjectsPythonProject1/.idea/PycharmProjectsPythonProject1.iml" filepath="D:/JetBrains/PycharmProjectsPythonProject1/.idea/PycharmProjectsPythonProject1.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/driver-distraction-fleet-system.iml" filepath="$PROJECT_DIR$/.idea/driver-distraction-fleet-system.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../resnet50/.idea/resnet50.iml" filepath="$PROJECT_DIR$/../resnet50/.idea/resnet50.iml" />
     </modules>
   </component>
 </project>
